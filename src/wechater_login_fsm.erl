@@ -1,9 +1,9 @@
 -module(wechater_login_fsm).
 -behaviour(gen_fsm).
 
--export([start_link/0, init/1, handle_info/3]).
+-export([start_link/0, init/1, handle_info/3, code_change/4, handle_event/3, handle_sync_event/4, terminate/3]).
 
--export([not_start/2, fetch_login_page/2]).
+-export([not_start/2, fetch_login_page/2, fetch_login_js/2, fetch_uuid/2, succeed/2]).
 
 -record(wx_profile, {uuid, cookie, timer, requests}).
 
@@ -13,8 +13,9 @@
 
 
 start_link() ->
-    gen_fsm:start_link({local, ?MODULE}, ?MODULE, [], []),
-    gen_fsm:send_event(?MODULE, start).
+    Ret = gen_fsm:start_link({local, ?MODULE}, ?MODULE, [], []),
+    gen_fsm:send_event(?MODULE, start),
+    Ret.
 
 init(_Args) ->
     Profile = #wx_profile{uuid = undefined
@@ -22,6 +23,18 @@ init(_Args) ->
                          , requests = []},
     {ok, not_start, Profile}.
 
+code_change(_OldVsn, State, Profile, _Ext) ->
+    {ok, State, Profile, _Ext}.
+
+handle_event({timeout, _Ref, _Msg}, _State, Profile) ->
+    new_login(Profile).
+
+handle_sync_event({timeout, _Ref, _Msg}, _From, _State, Profile) ->
+    new_login(Profile).
+
+terminate(_Reason, _State, _Profile) ->
+    ok.
+    
 not_start(start, Profile) ->
     new_login(Profile).
 
@@ -49,7 +62,8 @@ fetch_uuid({poll_login, Uuid}, Profile) ->
 
 poll_login({timeout, _Ref, _Msg}, Profile) ->
     new_login(Profile);
-poll_login(succeed, Profile) ->
+poll_login(succeed, Profile = #wx_profile{timer = Timer}) ->
+    gen_fsm:cancel_timer(Timer),
     {next_state, succeed, Profile};
 poll_login(not_yet, Profile = #wx_profile{uuid = Uuid}) ->
     Url = "https://login.wx.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
@@ -62,7 +76,7 @@ poll_login(viewed, Profile = #wx_profile{uuid = Uuid}) ->
     NewProfile = fetch_url(Url, login_status, Profile),
     {next_state, poll_login, NewProfile}.
 
-suceed(restart, Profile) ->
+succeed(restart, Profile) ->
     new_login(Profile).
 
 new_login(Profile) ->
@@ -72,6 +86,7 @@ new_login(Profile) ->
                                                         , uuid = undefined}}.
     
 fetch_url(Url, Ref, Profile = #wx_profile{requests = Requests}) ->
+    erlang:display("Fetching " ++ Url),
     case lists:keyfind(Ref, 1, Requests) of
         {_, Id} -> httpc:cancel_request(Id);
         false -> ok
@@ -80,9 +95,6 @@ fetch_url(Url, Ref, Profile = #wx_profile{requests = Requests}) ->
     NewRequests = lists:keystore(Ref, 1, Requests, {Ref, RequestId}),
     
     Profile#wx_profile{requests = NewRequests}.
-
-poll_wx_login_status(Profile) ->
-    ok.
 
 handle_info({http, Resp}, fetch_login_page, Profile) ->
     Succeed = fun(B, P) -> fetch_login_page({get_js, parse_loginjs(B)}, P) end,
@@ -127,6 +139,7 @@ parse_login_status(Js) ->
 
 parse_uuid(Js) ->
     {match, [Uuid|_]} = re:run(Js, "uuid[\s]*=[\s]*\"([a-z0-9]*)\";", [{capture, [1], list}]),
+    erlang:display("Get uuid " ++ Uuid),
     Uuid.
 
 parse_appid(Js) ->
@@ -135,11 +148,11 @@ parse_appid(Js) ->
 
 parse_loginjs(Html) ->
     Tree = mochiweb_html:parse(Html),
-    {_, Attr, _} = tree_find(fun({N, A, C}) ->
+    {_, Attr, _} = tree_find(fun({N, A, _C}) ->
                                      case N of
                                          <<"script">> ->
                                              case lists:keyfind(<<"src">>, 1, A) of
-                                                 {K, V} ->
+                                                 {_K, V} ->
                                                      case re:run(V, "login[0-9]+.js") of
                                                          {match, _} ->
                                                              true;
@@ -161,7 +174,7 @@ tree_find(Func, {N, A, []}) ->
             not_found
     end;
 
-tree_find(Func, Tree = {N, A, [C|Cs]}) ->
+tree_find(Func, Tree = {_N, _A, [C|Cs]}) ->
     case Func(Tree) of
         true ->
             Tree;
@@ -176,7 +189,7 @@ tree_find(Func, Tree = {N, A, [C|Cs]}) ->
                     tree_find(Func, Cs)
             end
     end;
-tree_find(Func, {N,_}) ->
+tree_find(_Func, {_N,_}) ->
     not_found;
 
 tree_find(Func, [N|Ns]) ->
@@ -191,7 +204,7 @@ tree_find(Func, [N|Ns]) ->
             tree_find(Func, Ns)
     end;
 
-tree_find(Func, []) ->
+tree_find(_Func, []) ->
     not_found.
 
 timestamp() ->
