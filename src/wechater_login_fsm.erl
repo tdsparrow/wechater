@@ -3,9 +3,9 @@
 
 -export([start_link/0, init/1, handle_info/3, code_change/4, handle_event/3, handle_sync_event/4, terminate/3]).
 
--export([not_start/2, fetch_login_page/2, fetch_login_js/2, fetch_uuid/2, succeed/2]).
+-export([not_start/2, fetch_login_page/2, fetch_login_js/2, fetch_uuid/2, poll_login/2, succeed/2, fetch_login_key/2]).
 
--record(wx_profile, {uuid, cookie, timer, requests}).
+-record(wx_profile, {uuid, keys, cookie, timer = undefined, requests}).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -47,7 +47,7 @@ fetch_login_page({get_js, JsUrl}, Profile) ->
 fetch_login_js({timeout, _Ref, _Msg}, Profile) ->
     new_login(Profile);
 fetch_login_js({get_uuid, Appid}, Profile) ->
-    Url = "https://login.wx.qq.com/jslogin?appid=" ++ Appid 
+    Url = "https://login.weixin.qq.com/jslogin?appid=" ++ Appid 
         ++ "&redirect_uri=&redirect_uri=https%3A%2F%2Fwx.qq.com%2Fcgi-bin%2Fmmwebwx-bin%2Fwebwxnewloginpage&fun=new&lang=en_US&_=" ++ timestamp(),
     NewProfile = fetch_url(Url, uuid, Profile),
     {next_state, fetch_uuid, NewProfile}.
@@ -55,32 +55,38 @@ fetch_login_js({get_uuid, Appid}, Profile) ->
 fetch_uuid({timeout, _Ref, _Msg}, Profile) ->
     new_login(Profile);
 fetch_uuid({poll_login, Uuid}, Profile) ->
-    Url = "https://login.wx.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
+    Url = "https://login.weixin.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
         ++ "&tip=1&_=" ++ timestamp(),
     NewProfile = fetch_url(Url, login_status, Profile),
     {next_state, poll_login, NewProfile#wx_profile{uuid = Uuid}}.
 
 poll_login({timeout, _Ref, _Msg}, Profile) ->
     new_login(Profile);
-poll_login(succeed, Profile = #wx_profile{timer = Timer}) ->
-    gen_fsm:cancel_timer(Timer),
-    {next_state, succeed, Profile};
+poll_login({succeed, RedirectUrl}, Profile) ->
+    NewProfile = fetch_url(RedirectUrl, login_key, Profile),
+    {next_state, fetch_login_key, NewProfile};
 poll_login(not_yet, Profile = #wx_profile{uuid = Uuid}) ->
-    Url = "https://login.wx.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
+    Url = "https://login.weixin.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
         ++ "&tip=1&_=" ++ timestamp(),
     NewProfile = fetch_url(Url, login_status, Profile),
     {next_state, poll_login, NewProfile};
 poll_login(viewed, Profile = #wx_profile{uuid = Uuid}) ->
-    Url = "https://login.wx.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
+    Url = "https://login.weixin.qq.com/cgi-bin/mmwebwx-bin/login?uuid=" ++ Uuid
         ++ "&tip=0&_=" ++ timestamp(),
     NewProfile = fetch_url(Url, login_status, Profile),
     {next_state, poll_login, NewProfile}.
+
+fetch_login_key({timeout, _Ref, _Msg}, Profile) ->
+    new_login(Profile);
+fetch_login_key({keys, Keys}, Profile) ->
+    NewProfile = cancel_timer(Profile),
+    {next_state, succeed, NewProfile#wx_profile{keys = Keys}}.
 
 succeed(restart, Profile) ->
     new_login(Profile).
 
 new_login(Profile) ->
-    NewProfile = fetch_url("https://wx.qq.com", login_page, Profile),
+    NewProfile = fetch_url("https://wx.qq.com", login_page, cancel_timer(Profile)),
     Timer = gen_fsm:start_timer(5 * 60 * 1000, []),
     {next_state, fetch_login_page, NewProfile#wx_profile{timer = Timer
                                                         , uuid = undefined}}.
@@ -106,13 +112,17 @@ handle_info({http, Resp}, fetch_login_js, Profile) ->
     Fail = fun(_, P) -> new_login(P) end,
     handle_http_resp(Resp, Profile, fetch_login_js, login_js, Succeed, Fail);
 handle_info({http, Resp}, fetch_uuid, Profile) ->
-    Succeed = fun(B, P) -> fetch_login_js({poll_login, parse_uuid(B)}, P) end,
+    Succeed = fun(B, P) -> fetch_uuid({poll_login, parse_uuid(B)}, P) end,
     Fail = fun(_, P) -> new_login(P) end,
     handle_http_resp(Resp, Profile, fetch_uuid, uuid, Succeed, Fail);
 handle_info({http, Resp}, poll_login, Profile) ->
     Succeed = fun(B, P) -> poll_login(parse_login_status(B), P) end,
     Fail = fun(_, P) -> new_login(P) end,
-    handle_http_resp(Resp, Profile, poll_login, login_status, Succeed, Fail).
+    handle_http_resp(Resp, Profile, poll_login, login_status, Succeed, Fail);
+handle_info({http, Resp}, fetch_login_key, Profile) ->
+    Succeed = fun(B, P) -> fetch_login_key({keys, parse_login_key(B)}, P) end,
+    Fail = fun(_, P) -> new_login(P) end,
+    handle_http_resp(Resp, Profile, fetch_login_key, login_key, Succeed, Fail).
 
 handle_http_resp({RequestId, Result}, Profile, State, HttpRef, Succeed, Fail) ->
     #wx_profile{requests = Requests} = Profile,
@@ -121,7 +131,7 @@ handle_http_resp({RequestId, Result}, Profile, State, HttpRef, Succeed, Fail) ->
             NewRequests = lists:keydelete(RequestId, 2, Requests),
             NewProfile = Profile#wx_profile{requests = NewRequests},
             case Result of
-                {ok, {_, _, B}} ->
+                {{_, _, "OK"}, _, B} ->
                     Succeed(B, NewProfile);
                 Err -> Fail(Err, NewProfile)
             end;
@@ -129,12 +139,32 @@ handle_http_resp({RequestId, Result}, Profile, State, HttpRef, Succeed, Fail) ->
             {next_state, State, Profile}
     end.
 
+cancel_timer(Profile = #wx_profile{timer = Timer}) ->
+    case Timer of
+        undefined ->
+            Profile;
+        _ -> gen_fsm:cancel_timer(Timer),
+             Profile#wx_profile{timer = undefined}
+    end.
+
+parse_login_key(Xml) ->
+    Tree = mochiweb_html:parse(Xml),
+    {_, _, [Skey]} = tree_find(fun({N, _, _}) -> N =:= <<"skey">> end, Tree),
+    {_, _, [Wxsid]} = tree_find(fun({N, _, _}) -> N =:= <<"wxsid">> end, Tree),
+    {_, _, [Wxuin]} = tree_find(fun({N, _, _}) -> N =:= <<"wxuin">> end, Tree),
+    {_, _, [Ticket]} = tree_find(fun({N, _, _}) -> N =:= <<"pass_ticket">> end, Tree),
+    [{skey, binary_to_list(Skey)}, {wxsid, binary_to_list(Wxsid)},
+     {wxuin, binary_to_list(Wxuin)}, {ticket, binary_to_list(Ticket)}].
+    
 parse_login_status(Js) ->
-    {match, [Code|_]} = re:run(Js, "window.code[\s]*=[\s]*([0-9]*);", [{capture, [1], list}]),
+    {match, [Code]} = re:run(Js, "window.code[\s]*=[\s]*([0-9]*);", [{capture, [1], list}]),
     case Code of
         "408" -> not_yet;
         "201" -> viewed;
-        "200" -> succeed
+        "200" -> 
+            {match, [Ticket,Scan]} = re:run(Js, "ticket=([0-9a-z]*).*scan=([0-9]*)", [{capture, [1,2], list}]),
+            {succeed, "https://wx.qq.com/cgi-bin/mmwebwx-bin/webwxnewloginpage?ticket=" ++ Ticket
+             ++ "&lang=en_US&scan=" ++ Scan ++ "&fun=new"}
     end.
 
 parse_uuid(Js) ->
@@ -153,7 +183,7 @@ parse_loginjs(Html) ->
                                          <<"script">> ->
                                              case lists:keyfind(<<"src">>, 1, A) of
                                                  {_K, V} ->
-                                                     case re:run(V, "login[0-9]+.js") of
+                                                     case re:run(V, "login[0-9a-z]+\.js") of
                                                          {match, _} ->
                                                              true;
                                                          _ -> false
@@ -227,4 +257,10 @@ parse_loginjs_test() ->
 parse_uuid_test() ->
     {ok, Html} = file:read_file("../test/fixtures/uuid.js"),
     ?assertEqual("637ef49c37fc43", parse_uuid(Html)).
+
+parse_login_key_test() ->
+    {ok, Html} = file:read_file("../test/fixtures/login_key.xml"),
+    Keys = parse_login_key(Html),
+    ?assertEqual({wxsid, "gE5rOlqivQYi0Mw2"}, lists:keyfind(wxsid, 1, Keys)).
+
 -endif.
